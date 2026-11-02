@@ -1,0 +1,167 @@
+"""
+Processing of Point Cloud data
+"""
+from files.Kdtree import KdTree_class
+import pandas as pd
+import copy
+#import plotly.graph_objects as go
+#import open3d as o3d
+import sys
+import numpy as np
+from scipy.cluster.hierarchy import dendrogram, linkage
+from sklearn.cluster import AgglomerativeClustering
+from sklearn.cluster import MeanShift
+from sklearn.cluster import MeanShift, estimate_bandwidth
+# Set the recursion limit to avoid RecursionError exception while building Kdtree
+sys.setrecursionlimit(10**8)
+
+
+class ProcessPointCloud:
+    """
+    ProcessPointCloud Class
+    """
+    def __init__(self, pcd_file, nrows_value, display_output_flag):
+        self.nrows = nrows_value
+
+        if type(pcd_file) == type(str()):
+
+            #if pcd_file.endswith(".pcd"):
+
+                #pcd = o3d.io.read_point_cloud(pcd_file)
+                #self.pcd_data = pd.DataFrame(pcd.points, columns={"X" ,"Y" ,"Z"})
+                #self.pcd_data = self.pcd_data[0:self.nrows]
+
+            if pcd_file.endswith(".xyz"):
+
+                self.pcd_data = pd.read_csv(pcd_file, delimiter=" ", nrows=nrows_value)
+            
+            else:
+
+                raise Exception(f"Unsupported datatype of pcd file.")
+
+        elif type(pcd_file) == type(list()):
+
+            self.pcd_data = pd.DataFrame(pcd_file, columns=["X" ,"Y" ,"Z"])
+
+            
+        self.kdtree_main = KdTree_class()
+        self.kdtree_root_node = self.kdtree_main.insert_points(self.pcd_data, display_output=display_output_flag)
+
+    def meanshift_clustring(self, xyz, distance_threshold, n_samples=500,n_jobs=4,bin_seeding=True,cluster_all=True):
+        bandwidth = estimate_bandwidth(xyz, quantile=distance_threshold, n_samples=n_samples)
+        ms = MeanShift(bandwidth=bandwidth,bin_seeding=bin_seeding, n_jobs=n_jobs,cluster_all=cluster_all).fit(xyz)
+        labels = ms.labels_
+        cluster_centers = ms.cluster_centers_
+        labels_unique = np.unique(labels)
+        n_clusters_ = len(labels_unique)
+        #print("number of estimated clusters : %d" % n_clusters_)
+        return cluster_centers, n_clusters_, labels
+
+
+    def euclidean_clustering(self, distance_threshold, cluster_parameters):
+        """
+        Perform Euclidean clustering
+        :param distance_threshold: minimum distance between points in a cluster
+        :param cluster_parameters: {min_size:value_1}
+        :return: identified clusters after Euclidean Clustering
+        """
+        clusters_identified = dict()
+        cluster_id = 0
+        # Set up a boolean list with all elements set to False
+        processed_flag = [False]*self.nrows
+        # Each row in pcd_data is a pcd point
+        for point in self.pcd_data.iterrows():
+            index = point[0]
+            current_point = (point[1]["X"], point[1]["Y"], point[1]["Z"])
+            if not processed_flag[index]:
+                base_cluster = set()
+                self.find_clusters(current_point, base_cluster, index, distance_threshold, cluster_parameters, processed_flag)
+                # If cluster is within the parameter limits
+                if base_cluster is not None:
+                    if (len(base_cluster) > cluster_parameters["min_size"]):
+                        clusters_identified[cluster_id] = base_cluster
+                        cluster_id += 1
+
+        # clear small groups
+        for i in range(len(clusters_identified)):
+            if len(clusters_identified[i]) <=3:
+                del clusters_identified[i]
+
+        return clusters_identified
+
+    def get_point(self, index):
+        """
+        return point
+        :param index: dataframe index
+        :return: point as tuple
+        """
+        return (self.pcd_data.loc[index]["X"],
+                self.pcd_data.loc[index]["Y"],
+                self.pcd_data.loc[index]["Z"])
+
+    def find_clusters(self, current_point_, base_cluster_, index_, threshold_, cluster_parameters_, processed_flag_):
+        """
+        search for clusters
+        :param current_point_: current point being processed.
+        :param base_cluster_: already known clusters.
+        :param index_: index of the point.
+        :param threshold_:  min distance for cluster identification.
+        :param cluster_parameters_: Cluster parameters {min_size}
+        :param processed_flag_: list containing status of points which have been identified as clusters.
+        """
+        # Considering points which have not been processed before, and are within are cluster parameter limits
+        if not processed_flag_[index_]:
+            processed_flag_[index_] = True
+            base_cluster_.add(index_)
+            # Returns id listof the points which are near the current point,
+            # id and index would be the same because of the unpacking design followed in build_kdtree method.
+            nearby_points = self.kdtree_main.search_elements(node=self.kdtree_root_node ,search_point=current_point_ ,
+                                                             distance_threshold=threshold_ ,depth=0)
+            # This line was added to retain the orginal variable during the process of recursion
+            # Using the same variable resulted in changing the contents during iteration
+            # which raised an exception.
+            nearby_points_ = copy.copy(nearby_points)
+            # If points are present search for more clusters
+            if len(nearby_points_):
+                for index_ in nearby_points_:
+                    #check if the index is avaiable
+                    if 0<= index_ <len(processed_flag_):
+                        if not processed_flag_[index_]:
+                            # Get the point in (x,y,z) for as required by the method
+                            point = self.get_point(index_)
+                            # Recursively iterate through all the points
+                            self.find_clusters(point, base_cluster_, index_,
+                                               threshold_, cluster_parameters_, processed_flag_)
+
+    def visualize_clusters(self, clusters):
+        """
+        Visualization of point cloud data
+        :param clusters: identified clusters
+        :return:
+        """
+        trace_1 = go.Scatter3d(x=self.pcd_data.X,
+                             y=self.pcd_data.Y,
+                             z=self.pcd_data.Z,
+                             mode='markers')
+        # extract points from clusters
+        cluster_points = pd.DataFrame(columns={"Cluster_id", "X", "Y", "Z"})
+        for key in clusters:
+            # Get all the indexes related to the cluster id = key
+            cluster_point_indexes = clusters[key]
+            for point_index in cluster_point_indexes:
+                point = self.get_point(point_index)
+                cluster_points = cluster_points.append({"Cluster_id": key,
+                                                         "X": point[0],
+                                                         "Y": point[1],
+                                                         "Z": point[2]}, ignore_index=True)
+        unique_clusters = []
+        for cluster_id in cluster_points.Cluster_id.unique():
+            cluster_traces = [go.Scatter3d(x=cluster_points[cluster_points["Cluster_id"] == cluster_id].X ,
+                                   y=cluster_points[cluster_points["Cluster_id"] == cluster_id].Y ,
+                                   z=cluster_points[cluster_points["Cluster_id"] == cluster_id].Z ,
+                                   mode='markers')]
+            unique_clusters.extend(cluster_traces)
+        data = [trace_1]
+        data.extend(unique_clusters)
+        fig = go.Figure(data)
+        fig.show()
